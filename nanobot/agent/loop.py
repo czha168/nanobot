@@ -8,8 +8,9 @@ import re
 import os
 import time
 from contextlib import AsyncExitStack, nullcontext
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, NamedTuple, NamedTuple
 
 from loguru import logger
 
@@ -38,6 +39,8 @@ from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
 if TYPE_CHECKING:
     from nanobot.config.schema import ChannelsConfig, ExecToolConfig, WebSearchConfig
     from nanobot.cron.service import CronService
+
+_AGENT_LOOP_RESULT_FIELDS = ("final_content", "tools_used", "messages", "is_rate_limited")
 
 
 class _LoopHook(AgentHook):
@@ -146,6 +149,14 @@ class _LoopHookChain(AgentHook):
         return self._extras.finalize_content(context, content)
 
 
+class _AgentLoopResult(NamedTuple):
+    """Result from _run_agent_loop including rate-limit metadata."""
+    final_content: str | None
+    tools_used: list[str]
+    messages: list[dict[str, Any]]
+    is_rate_limited: bool = False
+
+
 class AgentLoop:
     """
     The agent loop is the core processing engine.
@@ -159,6 +170,7 @@ class AgentLoop:
     """
 
     _RUNTIME_CHECKPOINT_KEY = "runtime_checkpoint"
+    _RATE_LIMIT_CHECKPOINT_KEY = "rate_limit_checkpoint"
 
     def __init__(
         self,
@@ -302,6 +314,47 @@ class AgentLoop:
         finally:
             self._mcp_connecting = False
 
+    _RATE_LIMIT_TTL_DAYS = 14
+
+    async def _resume_rate_limit_checkpoints(self) -> None:
+        """Scan all sessions for pending rate-limit checkpoints and resume valid ones."""
+        pending = self.sessions.scan_metadata(self._RATE_LIMIT_CHECKPOINT_KEY)
+        if not pending:
+            return
+        from datetime import datetime, timedelta
+        now = datetime.now()
+        ttl = timedelta(days=self._RATE_LIMIT_TTL_DAYS)
+        for session_key, checkpoint in pending:
+            try:
+                ts = datetime.fromisoformat(checkpoint["timestamp"])
+                if now - ts > ttl:
+                    session = self.sessions.get_or_create(session_key)
+                    session.metadata.pop(self._RATE_LIMIT_CHECKPOINT_KEY, None)
+                    self.sessions.save(session)
+                    logger.info("Expired rate-limit checkpoint for {}", session_key)
+                    continue
+                channel = checkpoint.get("channel", "cli")
+                chat_id = checkpoint.get("chat_id", "direct")
+                await self.bus.publish_outbound(OutboundMessage(
+                    channel=channel,
+                    chat_id=chat_id,
+                    content="Back online — resuming your earlier task...",
+                ))
+                synthetic_msg = InboundMessage(
+                    channel=channel,
+                    sender_id="system",
+                    chat_id=chat_id,
+                    content=checkpoint["original_message"],
+                    media=checkpoint.get("media") or [],
+                )
+                await self._dispatch(synthetic_msg)
+                session = self.sessions.get_or_create(session_key)
+                session.metadata.pop(self._RATE_LIMIT_CHECKPOINT_KEY, None)
+                self.sessions.save(session)
+                logger.info("Resumed rate-limit checkpoint for {}", session_key)
+            except Exception as e:
+                logger.warning("Failed to resume checkpoint for {}: {}", session_key, e)
+
     def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
         """Update context for all tools that need routing info."""
         for name in ("message", "spawn", "cron"):
@@ -339,7 +392,7 @@ class AgentLoop:
         channel: str = "cli",
         chat_id: str = "direct",
         message_id: str | None = None,
-    ) -> tuple[str | None, list[str], list[dict]]:
+    ) -> _AgentLoopResult:
         """Run the agent iteration loop.
 
         *on_stream*: called with each content delta during streaming.
@@ -389,12 +442,20 @@ class AgentLoop:
             logger.warning("Max iterations ({}) reached", self.max_iterations)
         elif result.stop_reason == "error":
             logger.error("LLM returned error: {}", (result.final_content or "")[:200])
-        return result.final_content, result.tools_used, result.messages
+        elif result.is_rate_limited:
+            logger.warning("Rate limit detected: {}", (result.final_content or "")[:200])
+        return _AgentLoopResult(
+            final_content=result.final_content,
+            tools_used=result.tools_used,
+            messages=result.messages,
+            is_rate_limited=result.is_rate_limited,
+        )
 
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
         self._running = True
         await self._connect_mcp()
+        await self._resume_rate_limit_checkpoints()
         logger.info("Agent loop started")
 
         while self._running:
@@ -531,7 +592,7 @@ class AgentLoop:
                 current_message=msg.content, channel=channel, chat_id=chat_id,
                 current_role=current_role,
             )
-            final_content, _, all_msgs = await self._run_agent_loop(
+            final_content, _, all_msgs, _is_rl = await self._run_agent_loop(
                 messages, session=session, channel=channel, chat_id=chat_id,
                 message_id=msg.metadata.get("message_id"),
             )
@@ -579,7 +640,7 @@ class AgentLoop:
                 channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
             ))
 
-        final_content, _, all_msgs = await self._run_agent_loop(
+        loop_result = await self._run_agent_loop(
             initial_messages,
             on_progress=on_progress or _bus_progress,
             on_stream=on_stream,
@@ -588,6 +649,28 @@ class AgentLoop:
             channel=msg.channel, chat_id=msg.chat_id,
             message_id=msg.metadata.get("message_id"),
         )
+        final_content = loop_result.final_content
+        all_msgs = loop_result.messages
+
+        if loop_result.is_rate_limited:
+            from datetime import datetime as _dt
+            checkpoint_data = {
+                "original_message": msg.content,
+                "media": msg.media if msg.media else None,
+                "timestamp": _dt.now().isoformat(),
+                "channel": msg.channel,
+                "chat_id": msg.chat_id,
+                "session_key": key,
+                "error_summary": (final_content or "Rate limit error")[:200],
+            }
+            session.metadata[self._RATE_LIMIT_CHECKPOINT_KEY] = checkpoint_data
+            self._clear_runtime_checkpoint(session)
+            self.sessions.save(session)
+            notification = "⚠️ Rate limit hit — your message has been saved. I'll resume it when I'm back online."
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content=notification,
+            )
 
         if final_content is None or not final_content.strip():
             final_content = EMPTY_FINAL_RESPONSE_MESSAGE
@@ -769,6 +852,7 @@ class AgentLoop:
     ) -> OutboundMessage | None:
         """Process a message directly and return the outbound payload."""
         await self._connect_mcp()
+        await self._resume_rate_limit_checkpoints()
         msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
         return await self._process_message(
             msg, session_key=session_key, on_progress=on_progress,

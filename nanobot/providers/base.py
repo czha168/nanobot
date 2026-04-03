@@ -74,6 +74,13 @@ class LLMProvider(ABC):
     _PERSISTENT_MAX_DELAY = 60
     _PERSISTENT_IDENTICAL_ERROR_LIMIT = 10
     _RETRY_HEARTBEAT_CHUNK = 30
+    _RATE_LIMIT_MARKERS = (
+        "429",
+        "rate limit",
+        "quota",
+        "resource exhausted",
+    )
+
     _TRANSIENT_ERROR_MARKERS = (
         "429",
         "rate limit",
@@ -190,6 +197,12 @@ class LLMProvider(ABC):
     def _is_transient_error(cls, content: str | None) -> bool:
         err = (content or "").lower()
         return any(marker in err for marker in cls._TRANSIENT_ERROR_MARKERS)
+
+    @classmethod
+    def is_rate_limit_error(cls, content: str | None) -> bool:
+        """Check whether *content* indicates a rate-limit / quota error."""
+        err = (content or "").lower()
+        return any(marker in err for marker in cls._RATE_LIMIT_MARKERS)
 
     @staticmethod
     def _strip_image_content(messages: list[dict[str, Any]]) -> list[dict[str, Any]] | None:

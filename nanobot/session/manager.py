@@ -234,3 +234,34 @@ class SessionManager:
                 continue
 
         return sorted(sessions, key=lambda x: x.get("updated_at", ""), reverse=True)
+
+    def scan_metadata(self, key: str) -> list[tuple[str, dict[str, Any]]]:
+        """Scan all sessions for a metadata key without loading full histories.
+
+        Reads only the metadata line (first JSONL line with ``_type == "metadata"``)
+        from each session file. Returns ``(session_key, value)`` pairs for sessions
+        where the requested key exists in their metadata dict.
+
+        Args:
+            key: The metadata key to look for.
+
+        Returns:
+            List of ``(session_key, metadata_value)`` tuples.
+        """
+        results: list[tuple[str, dict[str, Any]]] = []
+        for path in self.sessions_dir.glob("*.jsonl"):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    first_line = f.readline().strip()
+                    if not first_line:
+                        continue
+                    data = json.loads(first_line)
+                    if data.get("_type") != "metadata":
+                        continue
+                    metadata = data.get("metadata", {})
+                    if key in metadata:
+                        session_key = data.get("key") or path.stem.replace("_", ":", 1)
+                        results.append((session_key, metadata[key]))
+            except Exception:
+                continue
+        return results

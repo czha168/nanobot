@@ -71,6 +71,7 @@ class AgentRunResult:
     stop_reason: str = "completed"
     error: str | None = None
     tool_events: list[dict[str, str]] = field(default_factory=list)
+    is_rate_limited: bool = False
 
 
 class AgentRunner:
@@ -253,6 +254,12 @@ class AgentRunner:
             final_content = template.format(max_iterations=spec.max_iterations)
             self._append_final_message(messages, final_content)
 
+        is_rate_limited = False
+        if stop_reason == "error" and final_content:
+            if LLMProvider.is_rate_limit_error(final_content):
+                is_rate_limited = True
+                stop_reason = "rate_limited"
+
         return AgentRunResult(
             final_content=final_content,
             messages=messages,
@@ -261,6 +268,7 @@ class AgentRunner:
             stop_reason=stop_reason,
             error=error,
             tool_events=tool_events,
+            is_rate_limited=is_rate_limited,
         )
 
     def _build_request_kwargs(
